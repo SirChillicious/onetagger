@@ -184,7 +184,9 @@ jobs:
 
         cd target/release/bundle/osx
         chmod +x OneTagger.app/Contents/MacOS/onetagger
-        zip -r OneTagger-mac.zip .
+        codesign --force --deep --sign - OneTagger.app
+        codesign --verify --deep --strict --verbose=2 OneTagger.app
+        ditto -c -k --keepParent OneTagger.app OneTagger-mac.zip
         cd -
 
         cd target/release
