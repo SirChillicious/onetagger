@@ -163,7 +163,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        brew install rustup nodejs pnpm
+        brew install rustup nodejs
+        npm install -g pnpm@8
         rustup install stable
         cargo install cargo-bundle --version 0.6.1 --locked || true
     
