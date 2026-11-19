@@ -41,12 +41,92 @@ impl Beatport {
                 ("page", &page.to_string()),
                 ("per-page", &results_per_page.to_string())
             ])
-            .send()?
-            .text()?;
-        
+            .send()?;
+        let status = response.status();
+        let response = response.text()?;
+
         // Parse JSON
-        let results: BeatportTrackResults = self.get_next_data(&response)?;
-        Ok(results)
+        match self.get_next_data::<BeatportTrackResults>(&response) {
+            Ok(results) => Ok(results),
+            Err(e) => {
+                // Log what we got back to help diagnose, then fall back to the API search
+                let title = Html::parse_document(&response)
+                    .select(&Selector::parse("title").unwrap())
+                    .next()
+                    .map(|t| t.text().collect::<String>())
+                    .unwrap_or_default();
+                warn!("Beatport search page failed ({e}), HTTP {status}, page title: {:?}. Trying API search.", title.trim());
+                self.search_api(&query, page, results_per_page)
+            }
+        }
+    }
+
+    /// Search for tracks using the API (fallback when the search page doesn't work)
+    pub fn search_api(&self, query: &str, page: i32, results_per_page: usize) -> Result<BeatportTrackResults, Error> {
+        let token = self.update_token()?;
+        let response = self.client.get("https://api.beatport.com/v4/catalog/search/")
+            .bearer_auth(token)
+            .query(&[
+                ("q", query.to_string()),
+                ("type", "tracks".to_string()),
+                ("page", page.to_string()),
+                ("per_page", results_per_page.to_string())
+            ])
+            .send()?;
+        let status = response.status();
+        let body = response.text()?;
+        if !status.is_success() {
+            return Err(anyhow!("Beatport API search failed: HTTP {status}: {}", body.chars().take(300).collect::<String>()));
+        }
+        let value: Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow!("Beatport API search returned invalid JSON ({e}): {}", body.chars().take(300).collect::<String>()))?;
+
+        // Find the list of tracks, the exact shape may vary
+        let list = ["tracks", "results", "data"].iter()
+            .find_map(|k| {
+                let v = &value[*k];
+                if v.is_array() { return Some(v.clone()); }
+                ["data", "results"].iter().find_map(|k2| v[*k2].as_array().map(|_| v[*k2].clone()))
+            })
+            .ok_or(anyhow!("Beatport API search: unexpected response: {}", body.chars().take(300).collect::<String>()))?;
+
+        let data = list.as_array().unwrap().iter().filter_map(Self::api_search_item).collect::<Vec<_>>();
+        info!("Beatport API search returned {} tracks for: {}", data.len(), query);
+        Ok(BeatportTrackResults { data })
+    }
+
+    /// Convert one API search result (in either the old or new field naming) into a search result
+    fn api_search_item(t: &Value) -> Option<BeatportTrackResult> {
+        let s = |v: &Value| v.as_str().map(String::from);
+        let track_id = t["id"].as_i64().or(t["track_id"].as_i64())?;
+        let track_name = s(&t["name"]).or(s(&t["track_name"]))?;
+        let artists = t["artists"].as_array().map(|a| a.iter().filter_map(|a| Some(BeatportArtist {
+            artist_id: a["id"].as_i64().or(a["artist_id"].as_i64()).unwrap_or(0),
+            artist_name: s(&a["name"]).or(s(&a["artist_name"]))?,
+            artist_type_name: s(&a["artist_type_name"]).unwrap_or("Artist".to_string()),
+        })).collect());
+        let release = &t["release"];
+        let release = release.is_object().then(|| BeatportTrackResultRelease {
+            release_id: release["id"].as_i64().or(release["release_id"].as_i64()).unwrap_or(0),
+            release_image_uri: s(&release["image"]["uri"])
+                .or(s(&release["release_image_uri"]))
+                .or(s(&release["image"]["dynamic_uri"]).map(|u| u.replace("{w}", "1400").replace("{h}", "1400"))),
+        });
+        let genre = if t["genre"].is_array() {
+            t["genre"].as_array().map(|g| g.iter().filter_map(|g| s(&g["genre_name"]).or(s(&g["name"]))).map(|genre_name| BeatportTrackResultsGenre { genre_name }).collect())
+        } else {
+            s(&t["genre"]["name"]).map(|genre_name| vec![BeatportTrackResultsGenre { genre_name }])
+        };
+        Some(BeatportTrackResult {
+            track_id,
+            track_name,
+            artists,
+            isrc: s(&t["isrc"]),
+            length: t["length_ms"].as_u64().or(t["length"].as_u64()),
+            mix_name: s(&t["mix_name"]),
+            release,
+            genre,
+        })
     }
     
     /// Extract next hydratation data from html
